@@ -10,6 +10,13 @@ import threading
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional
 
+
+def _local_now_str() -> str:
+    """返回当前本地时间字符串（格式与 SQLite datetime 一致），
+    完全基于 Python datetime.now()，忠实反映 TZ 环境变量所指定的时区，
+    避免依赖 SQLite 内建 localtime 修饰符的实现差异。"""
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
 logger = logging.getLogger('sentinel.database')
 
 SCHEMA = """
@@ -18,8 +25,8 @@ CREATE TABLE IF NOT EXISTS traffic_hourly (
     hour_ts    TEXT NOT NULL UNIQUE,
     up_bytes   INTEGER NOT NULL DEFAULT 0,
     down_bytes INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now','localtime')),
-    updated_at TEXT DEFAULT (datetime('now','localtime'))
+    created_at TEXT,
+    updated_at TEXT
 );
 
 CREATE VIEW IF NOT EXISTS traffic_daily AS
@@ -66,17 +73,18 @@ class Database:
     def commit_stats(self, hourly_data: Dict[str, Dict]):
         if not hourly_data:
             return
+        now_str = _local_now_str()          # 统一用 Python 本地时间，严格跟随 TZ 变量
         with self._lock:
             with self._get_conn() as conn:
                 for hour_ts, stats in hourly_data.items():
                     conn.execute("""
-                        INSERT INTO traffic_hourly (hour_ts, up_bytes, down_bytes, updated_at)
-                        VALUES (?, ?, ?, datetime('now','localtime'))
+                        INSERT INTO traffic_hourly (hour_ts, up_bytes, down_bytes, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(hour_ts) DO UPDATE SET
                             up_bytes   = up_bytes   + excluded.up_bytes,
                             down_bytes = down_bytes + excluded.down_bytes,
-                            updated_at = datetime('now','localtime')
-                    """, (hour_ts, stats.get('up', 0), stats.get('down', 0)))
+                            updated_at = excluded.updated_at
+                    """, (hour_ts, stats.get('up', 0), stats.get('down', 0), now_str, now_str))
                 conn.commit()
 
     # ── 固定范围快捷查询 ──────────────────────────────────────────────────────

@@ -60,6 +60,12 @@ logger = logging.getLogger('sentinel.capture')
 # 本机 IP 刷新间隔（秒）
 LOCAL_IP_REFRESH_INTERVAL = 600
 
+# GUA /56 前缀刷新间隔（秒）——运营商拨号重连周期通常以小时计
+GUA_PREFIX_REFRESH_INTERVAL = 3600
+
+# 自动提取的 /56 前缀长度（中国电信/联通家宽标准前缀长度）
+GUA_PREFIX_LEN = 56
+
 # libpcap 内核接收缓冲区大小：32MB（默认通常只有 2MB，高流量时容易溢出丢包）
 SOCKET_RCVBUF_SIZE = 32 * 1024 * 1024
 
@@ -150,6 +156,41 @@ def detect_local_ips(iface: str) -> Set[str]:
     return ips
 
 
+def detect_gua_slash56_prefixes(iface: str, prefix_len: int = GUA_PREFIX_LEN) -> List[ipaddress.IPv6Network]:
+    """
+    从指定网卡的所有 IPv6 地址中提取全球单播地址（GUA）的 /56 前缀。
+
+    GUA 识别准则：IPv6 地址前 3 位为 001（即 2000::/3），
+    实际上就是以 '2' 或 '3' 开头的地址（0x20xx ~ 0x3Fxx）。
+    常见中国运营商 GUA 段：240e::/20（电信）、2409::/16（联通）等。
+
+    返回值：去重后的 IPv6Network 列表，供双端 LAN 过滤使用。
+    若网卡尚未获得公网 IPv6，则返回空列表（由调用方 fallback 处理）。
+    """
+    ips = detect_local_ips(iface)
+    prefixes: List[ipaddress.IPv6Network] = []
+    seen: set = set()
+
+    for ip_str in ips:
+        if ':' not in ip_str:          # 跳过 IPv4
+            continue
+        try:
+            addr = ipaddress.ip_address(ip_str)
+            # 判断是否为 GUA：首字节高 3 位 = 0b001 (0x20~0x3F)
+            if addr.version != 6 or (addr.packed[0] & 0xE0) != 0x20:
+                continue
+            # 提取 /prefix_len 前缀（strict=False 自动归零主机位）
+            net = ipaddress.ip_network(f"{ip_str}/{prefix_len}", strict=False)
+            key = str(net)
+            if key not in seen:
+                seen.add(key)
+                prefixes.append(net)
+        except ValueError:
+            pass
+
+    return prefixes
+
+
 def get_iface_index(iface: str) -> int:
     """获取网卡的接口索引号，用于绑定 raw socket"""
     return socket.if_nametoindex(iface)
@@ -227,14 +268,24 @@ class PacketCapture:
         self.stats = TrafficStats()
         self.running = False
 
-        self._extra_ipv6: List[ipaddress.IPv6Network] = []
+        # ── IPv6 LAN 前缀过滤策略 ────────────────────────────────────────────
+        # 优先级：手动指定 > 自动检测 GUA /56
+        # _manual_mode=True 时完全使用手动前缀，禁止覆盖。
+        manual_nets: List[ipaddress.IPv6Network] = []
         for prefix in (exclude_ipv6_prefixes or []):
             try:
                 net = ipaddress.ip_network(prefix.strip(), strict=False)
-                self._extra_ipv6.append(net)
-                logger.info(f"Added IPv6 exclusion prefix: {net}")
+                manual_nets.append(net)
+                logger.info(f"[IPv6-Filter] Manual exclusion prefix: {net}")
             except ValueError as e:
                 logger.warning(f"Invalid IPv6 prefix '{prefix}': {e}")
+
+        self._manual_mode: bool = len(manual_nets) > 0
+        # _lan_prefixes: 同时用于双端 LAN 检测和 _is_local_v6 单端判断
+        # 需要加锁，因为自动模式下每小时可能刷新
+        self._lan_prefixes: List[ipaddress.IPv6Network] = manual_nets
+        # 向后兼容：_extra_ipv6 保持引用，与 _lan_prefixes 共享同一列表对象
+        self._extra_ipv6 = self._lan_prefixes
 
         # 本机 IP 集合（含公网 IPv6），用于方向判定
         self._local_ips: Set[str] = set()
@@ -242,7 +293,7 @@ class PacketCapture:
         # 同时缓存为整数/bytes 格式用于高速比较
         self._local_v4_ints: Set[int] = set()
         self._local_v6_bytes: Set[bytes] = set()
-        self._refresh_local_ips()
+        self._refresh_local_ips()   # 启动时立即执行一次（含 /56 自动检测）
 
         self._refresh_thread = threading.Thread(
             target=self._ip_refresh_loop, daemon=True, name='ip-refresh'
@@ -287,13 +338,69 @@ class PacketCapture:
             if added:   logger.info(f"  + Added:   {added}")
             if removed: logger.info(f"  - Removed: {removed}")
 
+        # IP 变动时顺带刷新 /56 前缀（运营商重拨后地址段会改变）
+        if added or removed or not old_ips:
+            self._refresh_gua_prefixes()
+
+    def _refresh_gua_prefixes(self):
+        """
+        自动检测网卡上的 GUA 并提取 /56 前缀，更新 LAN 过滤器。
+        手动模式（EXCLUDE_IPV6_PREFIX 已设置）时跳过，不覆盖手动配置。
+        """
+        if self._manual_mode:
+            return  # 手动优先，禁止自动覆盖
+
+        new_prefixes = detect_gua_slash56_prefixes(self.iface, GUA_PREFIX_LEN)
+
+        with self._local_ips_lock:
+            old_keys = {str(n) for n in self._lan_prefixes}
+            new_keys  = {str(n) for n in new_prefixes}
+
+            if new_keys == old_keys:
+                return  # 无变化，不做多余日志
+
+            # 原地替换列表内容，_extra_ipv6 共享同一对象，无需额外同步
+            self._lan_prefixes.clear()
+            self._lan_prefixes.extend(new_prefixes)
+
+        if new_prefixes:
+            logger.info(
+                f"[IPv6-Filter] Auto GUA /56 prefixes updated: "
+                f"{[str(n) for n in new_prefixes]}"
+            )
+            logger.info(
+                "[IPv6-Filter] Intra-LAN IPv6 traffic "
+                f"(both endpoints in /{GUA_PREFIX_LEN}) will be excluded."
+            )
+        else:
+            logger.warning(
+                f"[IPv6-Filter] No GUA found on {self.iface}; "
+                "falling back to BUILTIN_IPV6_EXCLUDE only "
+                "(fe80::/10, ::1, fc00::/7, ff00::/8)."
+            )
+
     def _ip_refresh_loop(self):
+        """双速率刷新循环：
+        - 每 LOCAL_IP_REFRESH_INTERVAL 秒刷新本机 IP（应对 SLAAC 轮换）
+        - 每 GUA_PREFIX_REFRESH_INTERVAL 秒额外做一次 /56 前缀专项检测
+          （运营商重拨后地址段可能改变而具体地址未必变化）
+        """
+        elapsed = 0
         while True:
             time.sleep(LOCAL_IP_REFRESH_INTERVAL)
+            elapsed += LOCAL_IP_REFRESH_INTERVAL
             try:
                 self._refresh_local_ips()
             except Exception as e:
                 logger.error(f"IP refresh error: {e}")
+
+            # 每小时额外再做一次前缀专项刷新
+            if elapsed >= GUA_PREFIX_REFRESH_INTERVAL:
+                elapsed = 0
+                try:
+                    self._refresh_gua_prefixes()
+                except Exception as e:
+                    logger.error(f"GUA prefix refresh error: {e}")
 
     # ── 方向判定 ──────────────────────────────────────────────────────────────
 
@@ -310,13 +417,27 @@ class PacketCapture:
           - 链路本地/ULA/组播/loopback → True（本地侧）
           - 公网 IPv6 且在本机绑定列表中 → True（本机）
           - 公网 IPv6 且不在本机列表中 → False（远端）
+          - 公网 IPv6 且属于 LAN /56 前缀 → True（LAN 设备，视为本地侧）
         """
         # 先快速检查是否在本机列表（最常见的 NAS 自身 IPv6）
         with self._local_ips_lock:
             if addr_bytes in self._local_v6_bytes:
                 return True
-        # 再检查保留/私有网段
+        # 再检查保留/私有网段（BUILTIN）以及 LAN /56 前缀
         return _ipv6_bytes_is_excluded(addr_bytes, self._extra_ipv6)
+
+    def _is_in_lan_prefix(self, addr_bytes: bytes) -> bool:
+        """
+        判断一个 IPv6 地址是否属于当前检测到的 LAN 前缀（/56 或手动指定前缀）。
+        用于双端检查：src 和 dst 同时在 LAN 前缀内 → 局域网内部流量，应忽略。
+        只检查 _lan_prefixes，不包含 BUILTIN_IPV6_EXCLUDE。
+        """
+        with self._local_ips_lock:
+            prefixes = list(self._lan_prefixes)  # 快照，避免持锁过久
+        if not prefixes:
+            return False
+        addr = ipaddress.ip_address(addr_bytes)
+        return any(addr in net for net in prefixes)
 
     # ── 实时速率采样 ──────────────────────────────────────────────────────────
 
@@ -367,6 +488,11 @@ class PacketCapture:
 
         关键修复：使用 IPv6 头中的 payload length 字段（偏移 4-6 字节）
         加上固定的 40 字节 IPv6 基础头，得到 IP 层总长度作为计费字节数。
+
+        LAN 过滤：运营商将整个家庭局域网分配在同一个 /56 前缀下，
+        NAS 与手机/PC 等设备之间通过 IPv6 直连时 src 和 dst 同属该前缀。
+        这类流量属于局域网内部传输，不应计入公网流量统计。
+        过滤规则：not (src in /56 AND dst in /56)
         """
         if len(data) < 40:  # IPv6 固定头 40 字节
             return
@@ -377,16 +503,22 @@ class PacketCapture:
         src_bytes = data[8:24]    # src addr (16 bytes)
         dst_bytes = data[24:40]   # dst addr (16 bytes)
 
+        # ── 第一关：双端 LAN 前缀检测（优先执行，开销最低）──────────────
+        # 若 src 和 dst 同时属于 LAN /56 前缀 → 局域网内部流量，直接丢弃
+        if self._is_in_lan_prefix(src_bytes) and self._is_in_lan_prefix(dst_bytes):
+            return
+
+        # ── 第二关：方向判定 ─────────────────────────────────────────────
         src_local = self._is_local_v6(src_bytes)
         dst_local = self._is_local_v6(dst_bytes)
 
         if src_local and dst_local:
-            return  # 本地/内网互传，忽略
+            return  # 本地/内网互传（链路本地等），忽略
         if not src_local and not dst_local:
             return  # 两端都是公网且不是本机，忽略
 
         if src_local:
-            # NAS 发出（如：向手机发文件）→ 上行，remote = dst
+            # NAS 发出（如：向公网服务器上传）→ 上行，remote = dst
             remote = str(ipaddress.ip_address(dst_bytes))
             self.stats.add_bytes('up', ip_len, remote, ts)
         else:

@@ -5,6 +5,7 @@ NetTraffic-Sentinel - NAS公网流量监控程序
 """
 
 import os
+import sys
 import threading
 import time
 import logging
@@ -17,6 +18,32 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
 )
 logger = logging.getLogger('sentinel')
+
+
+def setup_timezone() -> None:
+    """
+    显式读取 TZ 环境变量并激活时区。
+    - 在 Linux/macOS 容器中调用 time.tzset() 让 C 运行时和 Python
+      datetime/time 模块立即切换到 TZ 指定的时区。
+    - Windows 不支持 tzset()，跳过即可（开发环境兼容）。
+    - 若未设置 TZ，程序沿用容器/系统默认时区（通常为 /etc/localtime 指向的区域）。
+    """
+    tz = os.environ.get('TZ', '')
+    if tz:
+        logger.info(f"TZ environment variable detected: {tz}")
+        if sys.platform != 'win32':
+            time.tzset()          # 通知 C 运行时重新读取 TZ，datetime.now() 立即生效
+            logger.info(f"Timezone applied via time.tzset(): {tz}")
+        else:
+            logger.warning("time.tzset() is not available on Windows; "
+                           "TZ env var may not take effect automatically.")
+    else:
+        logger.info("TZ env var not set; using system default timezone.")
+
+    # 打印实际生效的本地时间，便于日志核验
+    from datetime import datetime
+    logger.info(f"Current local time (post-tzset): {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
 
 # 环境变量配置
 MONITOR_IFACE    = os.environ.get('MONITOR_IFACE', 'eth0')
@@ -37,6 +64,9 @@ def persistence_loop(db: Database, capture: PacketCapture, interval: int):
             logger.error(f"Persistence error: {e}")
 
 def main():
+    # ── 第一步：激活时区（必须在任何 datetime 调用之前执行）──────────────
+    setup_timezone()
+
     logger.info("="*50)
     logger.info("  NetTraffic-Sentinel starting up")
     logger.info(f"  Interface : {MONITOR_IFACE}")

@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     gcc \
     python3-dev \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -35,7 +36,8 @@ ENV MONITOR_IFACE=eth0 \
     WEB_PORT=8080 \
     SAVE_INTERVAL=300 \
     DB_PATH=/data/traffic.db \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    TZ=UTC
 
 EXPOSE 8080
 

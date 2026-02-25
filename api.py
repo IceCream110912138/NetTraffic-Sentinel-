@@ -166,23 +166,38 @@ def create_app(db, capture):
     @app.route('/api/debug/local_ips')
     def api_debug_local_ips():
         """
-        调试接口：查看程序当前检测到的本机 IP 地址列表。
+        调试接口：查看程序当前检测到的本机 IP 地址列表及 LAN /56 前缀过滤器。
         用于验证公网 IPv6 是否被正确识别，确认上下行方向判断是否准确。
         访问：http://<NAS_IP>:<PORT>/api/debug/local_ips
         """
         ips = sorted(capture.local_ips)
         v4 = [ip for ip in ips if ':' not in ip]
         v6 = [ip for ip in ips if ':' in ip]
+
+        # 读取当前生效的 LAN 过滤前缀（手动或自动检测的 /56）
+        with capture._local_ips_lock:
+            lan_prefixes = [str(n) for n in capture._lan_prefixes]
+        manual_mode = capture._manual_mode
+
         return jsonify({
             'iface': os.environ.get('MONITOR_IFACE', 'eth0'),
             'ipv4': v4,
             'ipv6': v6,
             'total': len(ips),
+            'ipv6_lan_filter': {
+                'mode': 'manual' if manual_mode else 'auto-gua-/56',
+                'prefixes': lan_prefixes,
+                'note': (
+                    '手动模式：由 EXCLUDE_IPV6_PREFIX 环境变量指定，优先级最高。'
+                    if manual_mode else
+                    '自动模式：从网卡 GUA 提取 /56 前缀，每小时刷新一次。'
+                    '双端地址同属此前缀的 IPv6 包将被视为 LAN 内部流量并排除。'
+                ),
+            },
             'note': (
-                '上行/下行方向判断依赖此列表。'
-                '若 NAS 的公网 IPv6 未出现在 ipv6 列表中，'
-                '请检查 MONITOR_IFACE 环境变量是否与实际网卡名一致。'
-            )
+                '上行/下行方向判断依赖 ipv6 列表中的本机地址。'
+                '若 NAS 的公网 IPv6 未出现，请检查 MONITOR_IFACE 是否正确。'
+            ),
         })
 
     return app
