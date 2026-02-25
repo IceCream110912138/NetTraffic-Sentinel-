@@ -1,5 +1,9 @@
 # NetTraffic-Sentinel
 
+[![Docker](https://img.shields.io/badge/Docker-Supported-2496ED?style=flat-square&logo=docker)](https://www.docker.com/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9+-blue?style=flat-square&logo=python)](https://www.python.org/)
+
 **专为 NAS 设计的轻量级公网流量监控程序。** 直接监听物理网卡原始数据包，精准统计纯公网上下行流量，自动过滤局域网内部流量与 IPv6 私有地址，提供美观的 Web 可视化仪表盘与灵活的日期范围查询。
 
 ---
