@@ -47,7 +47,6 @@
 ---
 ## 软件截图
 <img width="2502" height="1255" alt="image" src="https://github.com/user-attachments/assets/a6e2257b-c67c-4a15-ae96-6515518038f0" />
----
 
 
 ## 功能特性
