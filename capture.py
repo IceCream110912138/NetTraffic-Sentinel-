@@ -46,6 +46,7 @@ capture.py - 抓包与流量统计核心模块
 import ipaddress
 import logging
 import os
+import queue
 import socket
 import struct
 import subprocess
@@ -68,6 +69,16 @@ GUA_PREFIX_LEN = 56
 
 # libpcap 内核接收缓冲区大小：32MB（默认通常只有 2MB，高流量时容易溢出丢包）
 SOCKET_RCVBUF_SIZE = 32 * 1024 * 1024
+
+# 生产者-消费者队列容量（包数）：限制内存占用，队列满时丢弃并计数
+# BT 同时数百连接时瞬时包速率可达数万 pkt/s
+PACKET_QUEUE_MAXSIZE = 50000
+
+# 内核丢包监控间隔（秒）
+KERNEL_DROP_MONITOR_INTERVAL = 60
+
+# 包处理速率统计间隔（秒），定期打印便于性能诊断
+PKT_RATE_LOG_INTERVAL = 60
 
 # 以太网协议类型常量
 ETH_P_IP   = 0x0800   # IPv4
@@ -196,6 +207,52 @@ def get_iface_index(iface: str) -> int:
     return socket.if_nametoindex(iface)
 
 
+def check_offload_status(iface: str) -> dict:
+    """
+    检测网卡 offload 状态，用于启动时的诊断日志。
+    方案1：调用 ethtool -k 解析输出（最可靠）。
+    方案2：读取 /sys/class/net/<iface>/gro_flush_timeout 等 sysfs 节点（fallback）。
+    返回字典 {feature: status_str}，检测失败时返回空字典。
+    """
+    result = {}
+    # ── 方案1：ethtool -k ──────────────────────────────────────────────────
+    try:
+        out = subprocess.run(
+            ['ethtool', '-k', iface],
+            capture_output=True, text=True, timeout=5
+        )
+        if out.returncode == 0:
+            key_map = {
+                'generic-receive-offload':  'gro',
+                'large-receive-offload':    'lro',
+                'tcp-segmentation-offload': 'tso',
+                'generic-segmentation-offload': 'gso',
+            }
+            for line in out.stdout.splitlines():
+                line = line.strip()
+                for full_key, short in key_map.items():
+                    if line.startswith(full_key + ':'):
+                        result[short] = line.split(':', 1)[1].strip()
+            return result
+    except FileNotFoundError:
+        pass  # ethtool 未安装，走 fallback
+    except Exception as e:
+        logger.debug(f"ethtool check_offload_status failed: {e}")
+
+    # ── 方案2：/sys 节点 fallback ─────────────────────────────────────────
+    # gro_flush_timeout=0 通常表示 GRO 已禁用（> 0 表示启用延迟聚合）
+    gft_path = f'/sys/class/net/{iface}/gro_flush_timeout'
+    try:
+        with open(gft_path) as f:
+            val = f.read().strip()
+        result['gro_flush_timeout_ns'] = val
+        result['gro_likely'] = 'off' if val == '0' else 'on (flush_timeout=%s ns)' % val
+    except Exception:
+        pass  # 内核版本/驱动差异，节点不存在
+
+    return result
+
+
 # ── 流量统计 ──────────────────────────────────────────────────────────────────
 
 class TrafficStats:
@@ -311,6 +368,32 @@ class PacketCapture:
             target=self._tick_loop, daemon=True, name='tick'
         )
         self._tick_thread.start()
+
+        # ── 诊断计数器与生产者-消费者队列 ──────────────────────────────────────
+        # 实际生效的 socket 接收缓冲区（KB），由 start() 写入
+        self._socket_buffer_actual_kb: int = 0
+        # 最近一个监控周期内的内核级丢包增量（通过 /proc/net/dev 采样）
+        self._kernel_drops_last_60s: int = 0
+        # 队列满时被丢弃的帧计数
+        self._queue_drop_count: int = 0
+        # 生产者-消费者解耦队列：recv 线程仅投帧，处理线程负责解析
+        # 队列上限防止内存无限增长；满时在生产者侧丢帧并告警
+        self._pkt_queue: queue.Queue = queue.Queue(maxsize=PACKET_QUEUE_MAXSIZE)
+
+        # 启动内核丢包监控线程
+        self._drop_monitor_thread = threading.Thread(
+            target=self._kernel_drop_monitor_loop, daemon=True, name='drop-monitor'
+        )
+        self._drop_monitor_thread.start()
+
+        # 启动包处理工作线程（消费者，从队列取帧并解析统计）
+        self._processor_thread = threading.Thread(
+            target=self._packet_processor_loop, daemon=True, name='pkt-processor'
+        )
+        self._processor_thread.start()
+
+        # 启动时检测网卡 offload 状态并写入诊断日志
+        self._log_offload_status()
 
     # ── 本机 IP 管理 ──────────────────────────────────────────────────────────
 
@@ -453,6 +536,133 @@ class PacketCapture:
             time.sleep(1)
             self.stats.tick_realtime()
 
+    # ── Offload 诊断 ──────────────────────────────────────────────────────────
+
+    def _log_offload_status(self):
+        """
+        启动时检测网卡 offload 状态并写入日志。
+        若 GRO/LRO/TSO 仍为开启，打印 WARNING 提示用户在宿主机禁用，
+        否则 raw socket 收到的是聚合帧，统计会偏低 30-70%。
+        """
+        status = check_offload_status(self.iface)
+        if not status:
+            logger.warning(
+                f"[Offload] Cannot detect offload status for {self.iface} "
+                "(ethtool unavailable and /sys fallback failed). "
+                "If GRO/LRO/TSO are enabled, traffic may be undercounted by 30-70%!"
+            )
+            return
+
+        # 找出仍处于开启状态的特性（排除 fixed 不可更改项）
+        on_features = [
+            k for k, v in status.items()
+            if isinstance(v, str) and 'on' in v.lower() and 'fixed' not in v.lower()
+            and k not in ('gro_flush_timeout_ns',)
+        ]
+        off_features = [
+            k for k, v in status.items()
+            if isinstance(v, str) and 'off' in v.lower()
+        ]
+
+        if on_features:
+            logger.warning(
+                f"[Offload] WARN: The following offload features are STILL ON "
+                f"for {self.iface}: {on_features}. "
+                "This can cause ~30-70% traffic undercount!"
+            )
+            hints = ' '.join(f"{k} off" for k in on_features
+                             if k not in ('gro_flush_timeout_ns', 'gro_likely'))
+            if hints:
+                logger.warning(f"[Offload] Fix: ethtool -K {self.iface} {hints}")
+        else:
+            logger.info(
+                f"[Offload] All monitored offload features are OFF on {self.iface}: {status}"
+            )
+
+    # ── 内核丢包监控 ──────────────────────────────────────────────────────────
+
+    def _kernel_drop_monitor_loop(self):
+        """
+        定期读取 /proc/net/dev 中网卡的 RX drop 计数（两次采样差值），
+        监控内核层面的丢包情况。
+        若60秒内发生丢包，打印 WARNING 并给出调参建议。
+        此计数会暴露给 /api/health 接口，便于前端监控。
+        """
+        def _read_drop() -> int | None:
+            try:
+                with open('/proc/net/dev', 'r') as f:
+                    for line in f:
+                        # 格式示例：
+                        #   eth0: rx_bytes packets errs drop fifo frame ...
+                        stripped = line.strip()
+                        if stripped.startswith(self.iface + ':'):
+                            parts = stripped.split()
+                            # parts[0]="eth0:", [1]=rx_bytes, [2]=rx_pkts,
+                            # [3]=rx_errs, [4]=rx_drop
+                            return int(parts[4])
+            except Exception as e:
+                logger.debug(f"[DropMonitor] Failed to read /proc/net/dev: {e}")
+            return None
+
+        last_drop = _read_drop()
+        while True:
+            time.sleep(KERNEL_DROP_MONITOR_INTERVAL)
+            cur_drop = _read_drop()
+            if cur_drop is not None and last_drop is not None:
+                delta = cur_drop - last_drop
+                self._kernel_drops_last_60s = max(delta, 0)
+                if delta > 0:
+                    logger.warning(
+                        f"[DropMonitor] Kernel dropped {delta} packets on {self.iface} "
+                        f"in last {KERNEL_DROP_MONITOR_INTERVAL}s "
+                        f"(cumulative since boot: {cur_drop})"
+                    )
+                    logger.warning(
+                        "[DropMonitor] To reduce kernel drops, run on host: "
+                        "sysctl -w net.core.rmem_max=134217728"
+                    )
+            if cur_drop is not None:
+                last_drop = cur_drop
+
+    # ── 包处理工作线程（消费者）─────────────────────────────────────────────
+
+    def _packet_processor_loop(self):
+        """
+        包处理消费者线程：从 _pkt_queue 取出 (frame, ts) 并调用 _parse_frame()。
+
+        通过与 recv 线程解耦，避免解析耗时阻塞缓冲区消费，
+        降低内核缓冲区被撑满的概率。
+
+        每 PKT_RATE_LOG_INTERVAL 秒打印一次处理速率与队列深度，
+        便于判断单线程处理是否成为瓶颈（若持续满队列则需考虑多工作线程）。
+        """
+        pkt_count = 0
+        last_log_time = time.time()
+
+        while True:
+            try:
+                frame, ts = self._pkt_queue.get(timeout=1.0)
+                self._parse_frame(frame, ts)
+                pkt_count += 1
+
+                # 定期打印速率诊断
+                now = time.time()
+                elapsed = now - last_log_time
+                if elapsed >= PKT_RATE_LOG_INTERVAL:
+                    rate = pkt_count / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        f"[PktProcessor] {rate:.0f} pkt/s, "
+                        f"queue depth: {self._pkt_queue.qsize()}/{PACKET_QUEUE_MAXSIZE}, "
+                        f"queue drops (total): {self._queue_drop_count}"
+                    )
+                    pkt_count = 0
+                    last_log_time = now
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"[PktProcessor] Error processing packet: {e}")
+
     # ── 数据包处理（轻量级手工解析，取代 Scapy 对象构建）────────────────────
 
     def _handle_ipv4(self, data: bytes, ts: float):
@@ -586,18 +796,47 @@ class PacketCapture:
             # 放大内核接收缓冲区，减少高流量下的丢包
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RCVBUF_SIZE)
             actual_buf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-            logger.info(f"Socket recv buffer: requested={SOCKET_RCVBUF_SIZE//1024}KB, actual={actual_buf//1024}KB")
+            self._socket_buffer_actual_kb = actual_buf // 1024
+            logger.info(
+                f"Socket recv buffer: requested={SOCKET_RCVBUF_SIZE//1024}KB, "
+                f"actual={actual_buf//1024}KB"
+            )
+
+            # 若实际缓冲区低于请求值的 50%，说明宿主机 net.core.rmem_max 限制过低
+            # BT 高并发下载时极易导致内核丢包，统计严重偏低
+            if actual_buf < SOCKET_RCVBUF_SIZE * 0.5:
+                logger.warning(
+                    f"[Buffer] Socket recv buffer is much smaller than requested "
+                    f"({actual_buf//1024}KB vs {SOCKET_RCVBUF_SIZE//1024}KB). "
+                    "High-traffic scenarios (BT) will likely suffer kernel drops!"
+                )
+                logger.warning(
+                    "[Buffer] Fix: run on host: sysctl -w net.core.rmem_max=134217728"
+                )
 
             # 设置非阻塞超时，便于检查 self.running 标志
             sock.settimeout(1.0)
 
-            logger.info("Raw socket ready, capturing packets...")
+            logger.info("Raw socket ready, capturing packets (producer->queue->processor)...")
 
             while self.running:
                 try:
                     frame = sock.recv(65535)
                     ts = time.time()
-                    self._parse_frame(frame, ts)
+                    # ── 生产者仅投帧到队列，不在此做任何解析 ──────────────
+                    # 解析由 _packet_processor_loop 在独立线程中完成，
+                    # recv 循环保持最低延迟，最大化内核缓冲区消费速度。
+                    try:
+                        self._pkt_queue.put_nowait((frame, ts))
+                    except queue.Full:
+                        self._queue_drop_count += 1
+                        # 每 1000 个丢帧打印一次，避免日志洪泛
+                        if self._queue_drop_count % 1000 == 1:
+                            logger.warning(
+                                f"[Buffer] Packet queue full! Total dropped by queue: "
+                                f"{self._queue_drop_count}. "
+                                "Processor thread may be too slow or traffic is extremely high."
+                            )
                 except socket.timeout:
                     continue
                 except Exception as e:
@@ -650,3 +889,13 @@ class PacketCapture:
     def local_ips(self) -> Set[str]:
         with self._local_ips_lock:
             return set(self._local_ips)
+
+    @property
+    def kernel_drops_last_60s(self) -> int:
+        """最近一个监控周期（60秒）内的内核层 RX drop 增量，0 表示无丢包。"""
+        return self._kernel_drops_last_60s
+
+    @property
+    def socket_buffer_actual_kb(self) -> int:
+        """实际生效的 socket 接收缓冲区大小（KB），0 表示 socket 尚未创建。"""
+        return self._socket_buffer_actual_kb

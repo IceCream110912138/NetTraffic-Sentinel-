@@ -19,24 +19,41 @@
 
 IFACE="${MONITOR_IFACE:-eth0}"
 
+# ── 方案1：通过 ethtool 禁用 offload（最可靠）────────────────────────────────
 if command -v ethtool &> /dev/null; then
-    echo "[entrypoint] Disabling NIC offload features on ${IFACE}..."
-    # 逐项禁用，某项不支持时忽略错误继续
+    echo "[entrypoint] Disabling NIC offload features on ${IFACE} via ethtool..."
     ethtool -K "${IFACE}" gro off    2>/dev/null && echo "  GRO  -> off" || echo "  GRO  -> not supported (skip)"
     ethtool -K "${IFACE}" lro off    2>/dev/null && echo "  LRO  -> off" || echo "  LRO  -> not supported (skip)"
     ethtool -K "${IFACE}" tso off    2>/dev/null && echo "  TSO  -> off" || echo "  TSO  -> not supported (skip)"
     ethtool -K "${IFACE}" gso off    2>/dev/null && echo "  GSO  -> off" || echo "  GSO  -> not supported (skip)"
     ethtool -K "${IFACE}" rx-gro-hw off 2>/dev/null || true
-    echo "[entrypoint] Offload settings applied."
+    echo "[entrypoint] Offload settings applied via ethtool."
 else
-    echo "[entrypoint] ethtool not found, skipping offload disable (may cause ~30-50% undercount)"
+    # ── 方案2：ethtool 不可用时，通过 /sys 接口尝试禁用 GRO ────────────────
+    echo "[entrypoint] WARNING: ethtool not found, attempting /sys fallback..."
+    GRO_TIMEOUT_PATH="/sys/class/net/${IFACE}/gro_flush_timeout"
+    GRO_LIST_PATH="/sys/class/net/${IFACE}/napi_defer_hard_irqs"
+    if [ -w "${GRO_TIMEOUT_PATH}" ]; then
+        echo 0 > "${GRO_TIMEOUT_PATH}"
+        echo "[entrypoint] /sys fallback: gro_flush_timeout set to 0 (GRO disabled)"
+    else
+        echo "[entrypoint] WARNING: /sys fallback also unavailable for ${IFACE}."
+        echo "[entrypoint] WARNING: GRO/LRO/TSO may still be ENABLED."
+        echo "[entrypoint] WARNING: Traffic statistics may be undercounted by 30-70%!"
+        echo "[entrypoint] WARNING: Install ethtool in the image to fix this:"
+        echo "[entrypoint] WARNING:   apt-get install -y ethtool"
+    fi
 fi
 
-# 尝试调大内核全局的 socket 接收缓冲区上限
-# 允许单个 socket 申请最大 64MB 的接收缓冲区
+# 尝试调大内核全局的 socket 接收缓冲区上限至 128MB
+# docker-compose.yml 的 sysctls 通常已设置此值，此处作为双重保障
 if [ -w /proc/sys/net/core/rmem_max ]; then
-    echo 67108864 > /proc/sys/net/core/rmem_max
-    echo "[entrypoint] net.core.rmem_max set to 64MB"
+    echo 134217728 > /proc/sys/net/core/rmem_max
+    echo 134217728 > /proc/sys/net/core/rmem_default 2>/dev/null || true
+    echo "[entrypoint] net.core.rmem_max set to 128MB"
+else
+    echo "[entrypoint] WARNING: Cannot write /proc/sys/net/core/rmem_max."
+    echo "[entrypoint] WARNING: Add 'sysctls: [net.core.rmem_max=134217728]' to docker-compose.yml"
 fi
 
 echo "[entrypoint] Starting NetTraffic-Sentinel..."

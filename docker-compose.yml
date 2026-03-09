@@ -14,6 +14,13 @@ services:
       - NET_RAW
       - NET_ADMIN
 
+    sysctls:
+      # 允许单个 socket 申请最大 128MB 的接收缓冲区。
+      # 默认值通常仅 212KB，BT 下载等高并发场景会导致内核层丢包，
+      # 流量统计因此严重偏低（可达 30-70%），必须调大此值。
+      - net.core.rmem_max=134217728
+      - net.core.rmem_default=134217728
+
     environment:
       - MONITOR_IFACE=eth0              # 修改为你的网卡名
       - TZ=Asia/Shanghai                # 时区：影响今日/本月统计的日期归属，必须与你所在时区一致

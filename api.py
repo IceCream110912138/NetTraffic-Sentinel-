@@ -163,7 +163,14 @@ def create_app(db, capture):
 
     @app.route('/api/health')
     def api_health():
-        return jsonify({'status': 'ok', 'ts': datetime.now().isoformat()})
+        return jsonify({
+            'status': 'ok',
+            'ts': datetime.now().isoformat(),
+            # 最近60秒内核层 RX drop 增量（0 = 无丢包）
+            'kernel_drops_last_60s': capture.kernel_drops_last_60s,
+            # 实际生效的 socket 接收缓冲区（KB），低于 16384 时 BT 高并发易丢包
+            'socket_buffer_actual_kb': capture.socket_buffer_actual_kb,
+        })
 
 
     @app.route('/api/debug/local_ips')
